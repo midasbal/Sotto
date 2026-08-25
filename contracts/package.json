@@ -26,6 +26,7 @@
   "dependencies": {
     "@fhevm/mock-utils": "^0.4.2",
     "@fhevm/solidity": "^0.11.1",
+    "@openzeppelin/confidential-contracts": "^0.5.3",
     "encrypted-types": "^0.0.4"
   },
   "devDependencies": {
