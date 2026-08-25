@@ -5,6 +5,8 @@ import {
   ConfidentialTestUSD__factory,
   Pool,
   Pool__factory,
+  ReserveYieldSource,
+  ReserveYieldSource__factory,
   TestUSD,
   TestUSD__factory,
 } from "../types";
@@ -37,18 +39,24 @@ async function claimWrapAndDeposit(
   return tx.wait();
 }
 
+const DRAW_INTERVAL = 24n * 60n * 60n; // arbitrary; the draw itself is out of scope for these tests
+
 describe("Pool", function () {
+  let deployer: HardhatEthersSigner;
   let alice: HardhatEthersSigner;
   let bob: HardhatEthersSigner;
   let token: TestUSD;
   let tokenAddress: string;
   let wrapper: ConfidentialTestUSD;
   let wrapperAddress: string;
+  let yieldSource: ReserveYieldSource;
+  let yieldSourceAddress: string;
   let pool: Pool;
   let poolAddress: string;
 
   before(async function () {
     const signers = await ethers.getSigners();
+    deployer = signers[0];
     alice = signers[1];
     bob = signers[2];
   });
@@ -68,8 +76,18 @@ describe("Pool", function () {
     wrapper = (await wrapperFactory.deploy(tokenAddress)) as ConfidentialTestUSD;
     wrapperAddress = await wrapper.getAddress();
 
+    const yieldSourceFactory = (await ethers.getContractFactory(
+      "ReserveYieldSource",
+    )) as ReserveYieldSource__factory;
+    yieldSource = (await yieldSourceFactory.deploy(
+      tokenAddress,
+      wrapperAddress,
+      deployer.address,
+    )) as ReserveYieldSource;
+    yieldSourceAddress = await yieldSource.getAddress();
+
     const poolFactory = (await ethers.getContractFactory("Pool")) as Pool__factory;
-    pool = (await poolFactory.deploy(wrapperAddress)) as Pool;
+    pool = (await poolFactory.deploy(wrapperAddress, yieldSourceAddress, DRAW_INTERVAL)) as Pool;
     poolAddress = await pool.getAddress();
   });
 
