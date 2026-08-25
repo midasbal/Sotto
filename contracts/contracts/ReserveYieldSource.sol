@@ -4,6 +4,7 @@ pragma solidity ^0.8.27;
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IYieldSource} from "./IYieldSource.sol";
 import {ConfidentialTestUSD} from "./ConfidentialTestUSD.sol";
@@ -17,8 +18,18 @@ import {ConfidentialTestUSD} from "./ConfidentialTestUSD.sol";
 /// external yield source (a lending market, an LP position, a staking vault) would
 /// implement this same {IYieldSource} interface while actually generating the funds
 /// it pays out, with no change required on the consuming side.
-contract ReserveYieldSource is IYieldSource, Ownable {
+contract ReserveYieldSource is IYieldSource, Ownable2Step {
     using SafeERC20 for IERC20;
+
+    /// @notice The maximum per-second accrual rate {setRate} will accept, scaled by
+    /// 1e18.
+    /// @dev An absurdly high per-second rate on its own (1e18 means the entire
+    /// principal accrues as prize every second) and still far below the point where
+    /// {_cappedPrize}'s multiplication could overflow. Caps the operator-error
+    /// footgun where an extreme rate, left accruing long enough, makes every future
+    /// {harvest} revert on overflow, which would otherwise only be recoverable by
+    /// lowering the rate again.
+    uint256 public constant MAX_RATE = 1e18;
 
     /// @notice The plaintext reserve asset (tUSD) this contract holds and accrues.
     IERC20 public immutable underlying;
@@ -43,6 +54,9 @@ contract ReserveYieldSource is IYieldSource, Ownable {
     /// @dev `caller` called {harvest} but is not the authorized {consumer}.
     error UnauthorizedConsumer(address caller);
 
+    /// @dev {setRate} was called with `attempted` above {MAX_RATE}.
+    error RateTooHigh(uint256 attempted, uint256 maxRate);
+
     /// @param underlying_ The plaintext reserve asset (tUSD).
     /// @param wrapper_ The confidential wrapper (ctUSD) prizes are delivered through.
     /// @param initialOwner The address authorized to fund the reserve and configure it.
@@ -61,8 +75,12 @@ contract ReserveYieldSource is IYieldSource, Ownable {
     }
 
     /// @notice Sets the per-second accrual rate.
+    /// @dev Reverts with {RateTooHigh} above {MAX_RATE}.
     /// @param ratePerSecondScaled1e18 The new rate, scaled by 1e18.
     function setRate(uint256 ratePerSecondScaled1e18) external onlyOwner {
+        if (ratePerSecondScaled1e18 > MAX_RATE) {
+            revert RateTooHigh(ratePerSecondScaled1e18, MAX_RATE);
+        }
         rate = ratePerSecondScaled1e18;
     }
 

@@ -86,10 +86,13 @@ describe("ReserveYieldSource", function () {
   it("caps pendingPrize at the reserve once accrued would exceed it", async function () {
     const reserveBalance = await token.balanceOf(yieldSourceAddress);
 
-    // A rate high enough that a short elapsed window already accrues far past the reserve.
-    const hugeRate = RATE_SCALE * 1_000_000n;
-    await (await yieldSource.connect(owner).setRate(hugeRate)).wait();
-    await time.increase(10);
+    // The maximum allowed rate, held long enough that accrual still runs past the
+    // reserve: at MAX_RATE this basis accrues 1e9 raw units per second, so 15
+    // seconds comfortably exceeds the 1e10 reserve without needing a rate above
+    // MAX_RATE.
+    const maxRate = await yieldSource.MAX_RATE();
+    await (await yieldSource.connect(owner).setRate(maxRate)).wait();
+    await time.increase(15);
 
     const pending = await yieldSource.pendingPrize(principalBasis);
     expect(pending).to.eq(reserveBalance);
@@ -131,9 +134,9 @@ describe("ReserveYieldSource", function () {
   it("caps harvest at the reserve and never wraps more than the reserve holds", async function () {
     const reserveBalance = await token.balanceOf(yieldSourceAddress);
 
-    const hugeRate = RATE_SCALE * 1_000_000n;
-    await (await yieldSource.connect(owner).setRate(hugeRate)).wait();
-    await time.increase(10);
+    const maxRate = await yieldSource.MAX_RATE();
+    await (await yieldSource.connect(owner).setRate(maxRate)).wait();
+    await time.increase(15);
 
     await (await yieldSource.connect(consumer).harvest(recipient.address, principalBasis)).wait();
 

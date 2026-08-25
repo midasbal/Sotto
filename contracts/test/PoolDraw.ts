@@ -600,4 +600,42 @@ describe("Pool draw (phase 4b)", function () {
     expect(await pool.drawState()).to.eq(DrawStateIdle);
     expect(await pool.depositorCount()).to.eq(0n);
   });
+
+  it("reverts a reveal-signature replay: an old draw's valid (clearTotal, proof) cannot verify against a new draw's handle", async function () {
+    await claimWrapAndDeposit(token, wrapper, wrapperAddress, poolAddress, alice, 100_000_000n);
+
+    // Complete one full draw and capture its valid (clearTotal, proof) pair.
+    await time.increase(DRAW_INTERVAL);
+    const firstStartTx = await pool.startDraw();
+    const firstStartReceipt = await firstStartTx.wait();
+    const firstDrawStarted = firstStartReceipt!.logs
+      .map((log) => pool.interface.parseLog(log))
+      .find((parsed) => parsed?.name === "DrawStarted");
+    const firstTotalHandle: string = firstDrawStarted!.args.total;
+
+    const firstDecryption = await fhevm.publicDecrypt([firstTotalHandle]);
+    const oldClearTotal = Object.values(firstDecryption.clearValues)[0] as bigint;
+    const oldProof = firstDecryption.decryptionProof;
+
+    await (await pool.fulfillReveal(oldClearTotal, oldProof)).wait();
+    await advanceUntilIdle();
+    expect(await pool.drawState()).to.eq(DrawStateIdle);
+
+    // Change the pool total so the next draw's real total would differ too, then
+    // start a second, independent draw: a fresh ciphertext handle even if the
+    // underlying numeric total happened to coincide.
+    await claimWrapAndDeposit(token, wrapper, wrapperAddress, poolAddress, bob, 50_000_000n);
+
+    await time.increase(DRAW_INTERVAL);
+    await (await pool.startDraw()).wait();
+    expect(await pool.drawState()).to.eq(DrawStateRevealing);
+
+    // The old, genuinely-valid (clearTotal, proof) pair must not verify against the
+    // new draw's snapshotted handle.
+    await expect(pool.fulfillReveal(oldClearTotal, oldProof)).to.be.reverted;
+
+    // The new draw is unaffected: it can still be completed normally with its own
+    // real reveal.
+    expect(await pool.drawState()).to.eq(DrawStateRevealing);
+  });
 });

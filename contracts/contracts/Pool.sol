@@ -7,6 +7,7 @@ import {IERC7984} from "@openzeppelin/confidential-contracts/interfaces/IERC7984
 import {IERC7984Receiver} from "@openzeppelin/confidential-contracts/interfaces/IERC7984Receiver.sol";
 import {FHESafeMath} from "@openzeppelin/confidential-contracts/utils/FHESafeMath.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {SafeCast} from "@openzeppelin/contracts/utils/math/SafeCast.sol";
 import {IYieldSource} from "./IYieldSource.sol";
 
 /// @title Pool
@@ -121,8 +122,12 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// @dev The plaintext prize harvested by {fulfillReveal} for the draw currently
     /// in {DrawState.Walking}, re-derived into an encrypted constant on each
     /// {advanceDraw} call rather than persisted as ciphertext, since the plaintext
-    /// value is already public from {DrawRevealed}.
-    uint256 private _prize;
+    /// value is already public from {DrawRevealed}. Stored as `uint64`, the same
+    /// width {advanceDraw} re-derives an encrypted constant from: {fulfillReveal}
+    /// validates the raw `uint256` returned by {IYieldSource-harvest} with
+    /// {SafeCast-toUint64} before it is ever assigned here, so every later read of
+    /// this field is already known to fit, with no separate bound to re-check.
+    uint64 private _prize;
 
     /// @dev The encrypted winning dart for the draw currently in
     /// {DrawState.Walking}, drawn once by {fulfillReveal} and reused unchanged by
@@ -230,6 +235,8 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// rather than a hardcoded `true`, so that if a credit were ever to fail, `asset`
     /// would refund the depositor instead of silently swallowing the deposit.
     /// Reverts with {DrawActive} while any draw is in progress; see {whenIdle}.
+    /// Guarded by `nonReentrant` for consistency with the other state-changing
+    /// entry points, even though this hook makes no external calls of its own.
     ///
     /// In practice the credit-failure branch is unreachable, not merely untested: the
     /// ctUSD wrapper caps its confidential total supply at `type(uint64).max` (see
@@ -248,7 +255,7 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
         address from,
         euint64 amount,
         bytes calldata /* data */
-    ) external override whenIdle returns (ebool accepted) {
+    ) external override nonReentrant whenIdle returns (ebool accepted) {
         if (msg.sender != address(asset)) revert UnauthorizedToken(msg.sender);
 
         _addDepositor(from);
@@ -347,6 +354,16 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// then cast down to `euint64`, rather than reducing a 64-bit random directly:
     /// the modulo-reduction bias this leaves is bounded by `clearTotal / 2^128`,
     /// negligible for any total representable in a `euint64`.
+    ///
+    /// The prize returned by `yieldSource.harvest` is validated with
+    /// {SafeCast-toUint64} before being stored: `IYieldSource` is a pluggable
+    /// interface, and a future or misconfigured implementation could in principle
+    /// return a value above `type(uint64).max`. A raw cast would truncate that
+    /// silently, crediting the winner less (or nothing) while the plaintext
+    /// `DrawRevealed`/`DrawCompleted` events still advertised the untruncated
+    /// amount. {SafeCast-toUint64} reverts instead, which rolls back this entire
+    /// call, including the `Walking` transition above, back to `Revealing`; the
+    /// draw is recoverable via {abortDraw} once `drawTimeout` elapses.
     /// @param clearTotal The plaintext aggregate total, as publicly decrypted off
     /// chain from the handle {startDraw} snapshotted.
     /// @param proof The KMS decryption proof attesting to `clearTotal`.
@@ -370,7 +387,7 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
         _drawDepositorCount = _depositors.length;
 
         uint256 prize = yieldSource.harvest(address(this), clearTotal);
-        _prize = prize;
+        _prize = SafeCast.toUint64(prize);
 
         euint128 rawDart = FHE.rem(FHE.randEuint128(), uint128(clearTotal));
         euint64 dart = FHE.asEuint64(rawDart);
@@ -408,7 +425,10 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
 
         euint64 dart = _dart;
         euint64 runningSum = _runningSum;
-        euint64 encryptedPrize = FHE.asEuint64(uint64(_prize));
+        // `_prize` was already validated with SafeCast.toUint64 in fulfillReveal and
+        // stored as uint64, so this re-derivation relies on that same bound rather
+        // than re-checking or re-casting it here.
+        euint64 encryptedPrize = FHE.asEuint64(_prize);
 
         for (uint256 i = 0; i < step; i++) {
             address depositor = _depositors[cursor + i];
