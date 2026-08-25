@@ -40,6 +40,7 @@ async function claimWrapAndDeposit(
 }
 
 const DRAW_INTERVAL = 24n * 60n * 60n; // arbitrary; the draw itself is out of scope for these tests
+const DRAW_TIMEOUT = 24n * 60n * 60n; // arbitrary; the draw itself is out of scope for these tests
 
 describe("Pool", function () {
   let deployer: HardhatEthersSigner;
@@ -87,7 +88,7 @@ describe("Pool", function () {
     yieldSourceAddress = await yieldSource.getAddress();
 
     const poolFactory = (await ethers.getContractFactory("Pool")) as Pool__factory;
-    pool = (await poolFactory.deploy(wrapperAddress, yieldSourceAddress, DRAW_INTERVAL)) as Pool;
+    pool = (await poolFactory.deploy(wrapperAddress, yieldSourceAddress, DRAW_INTERVAL, DRAW_TIMEOUT)) as Pool;
     poolAddress = await pool.getAddress();
   });
 

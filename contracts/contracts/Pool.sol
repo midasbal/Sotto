@@ -32,15 +32,39 @@ import {IYieldSource} from "./IYieldSource.sol";
 /// advertised); the winner's identity is not, and is knowable only to the winner, who
 /// learns it by user-decrypting their own new balance.
 ///
-/// This phase (4a) walks the full depositor set in a single transaction and does not
-/// freeze deposits or withdrawals during a reveal window; both are accepted here as
-/// this phase's known scope, deferred to a later chunked, freeze-aware phase.
+/// Draw lifecycle: Idle -> Revealing -> Walking -> Idle. {startDraw} moves Idle to
+/// Revealing. {fulfillReveal} moves Revealing to Walking (or straight back to Idle, on
+/// an empty pool). {advanceDraw} processes the depositor set in bounded batches of up
+/// to {MAX_CHUNK} and moves Walking back to Idle once every depositor has been
+/// processed. Deposits and withdrawals are frozen for the whole span from Revealing
+/// through Walking (see {whenIdle}), not just during the walk: the walk's balances
+/// must match the total that was actually revealed, and a deposit or withdrawal
+/// landing mid-draw would let the aggregate total and the live balances drift apart.
+///
+/// {abortDraw} only ever applies in Revealing, never in Walking. Revealing is the one
+/// step with a genuine external dependency: a publicly-decrypted reveal that must be
+/// submitted by someone, off chain, and could in principle never arrive. Walking has
+/// no such dependency; it is a fixed, deterministic amount of work over data already
+/// on chain, so it always completes given enough {advanceDraw} calls. A harvested
+/// prize is only ever debited from the yield source inside {fulfillReveal}, at the
+/// same moment the draw commits to Walking, so an abort (Revealing-only, pre-harvest)
+/// never leaves a harvested prize stranded, and Walking (post-harvest) never needs an
+/// abort path to begin with: funds can never be trapped and a harvested prize can
+/// never be left unallocated.
 contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// @notice The lifecycle state of the draw.
     enum DrawState {
         Idle,
-        Revealing
+        Revealing,
+        Walking
     }
+
+    /// @notice The maximum number of depositors {advanceDraw} processes per call.
+    /// @dev Conservative on purpose. The FHEVM mock used in tests does not enforce
+    /// the real per-transaction HCU budget, so this bound is chosen for safety margin
+    /// rather than derived from a measured limit; confirming it fits the real Sepolia
+    /// HCU budget is a phase-5 concern, not verified here.
+    uint256 public constant MAX_CHUNK = 20;
 
     /// @notice The ctUSD confidential token this pool accepts deposits in and pays
     /// withdrawals and prizes out in.
@@ -52,6 +76,10 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// @notice The minimum time that must elapse between the start of one draw and
     /// the next.
     uint256 public immutable drawInterval;
+
+    /// @notice The maximum time a draw may sit in {DrawState.Revealing} before
+    /// {abortDraw} may reset it.
+    uint256 public immutable drawTimeout;
 
     /// @dev Encrypted principal balance credited to each depositor.
     mapping(address depositor => euint64 balance) private _balances;
@@ -76,10 +104,42 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// @notice The timestamp the most recent draw was started at.
     uint256 public lastDraw;
 
+    /// @notice The timestamp the current draw entered {DrawState.Revealing}.
+    uint256 public drawStartedAt;
+
     /// @dev The encrypted total snapshotted and marked publicly decryptable when the
-    /// current reveal was started, verified against on {fulfillDraw}. Distinct from
-    /// `_totalDeposits`, which may keep moving while a reveal is outstanding.
+    /// current reveal was started, verified against on {fulfillReveal}. Distinct from
+    /// `_totalDeposits`, which may keep moving right up until {startDraw} freezes it
+    /// (deposits and withdrawals are rejected from that point on; see {whenIdle}).
     euint64 private _revealingTotal;
+
+    /// @dev The plaintext aggregate total revealed by {fulfillReveal} for the draw
+    /// currently in {DrawState.Walking}. Carried across {advanceDraw} calls purely to
+    /// re-emit alongside the prize on {DrawCompleted}.
+    uint256 private _revealedTotal;
+
+    /// @dev The plaintext prize harvested by {fulfillReveal} for the draw currently
+    /// in {DrawState.Walking}, re-derived into an encrypted constant on each
+    /// {advanceDraw} call rather than persisted as ciphertext, since the plaintext
+    /// value is already public from {DrawRevealed}.
+    uint256 private _prize;
+
+    /// @dev The encrypted winning dart for the draw currently in
+    /// {DrawState.Walking}, drawn once by {fulfillReveal} and reused unchanged by
+    /// every {advanceDraw} call across the walk.
+    euint64 private _dart;
+
+    /// @dev The encrypted running sum of balances processed so far in the current
+    /// walk, persisted and updated across {advanceDraw} calls.
+    euint64 private _runningSum;
+
+    /// @dev The number of depositors already processed in the current walk.
+    uint256 private _cursor;
+
+    /// @dev The depositor count snapshotted when the current walk began. Depositors
+    /// added after this point (blocked anyway by {whenIdle} while a draw is active)
+    /// are never in scope for this draw.
+    uint256 private _drawDepositorCount;
 
     /// @notice Emitted when `depositor`'s encrypted balance is credited by a deposit.
     /// @dev `newBalance` is an FHE ciphertext handle, never a plaintext amount.
@@ -91,7 +151,7 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
 
     /// @notice Emitted when a draw reveal is started.
     /// @dev `total` is an FHE ciphertext handle, not a plaintext amount; it is the
-    /// value that must be publicly decrypted and submitted to {fulfillDraw}.
+    /// value that must be publicly decrypted and submitted to {fulfillReveal}.
     event DrawStarted(euint64 total);
 
     /// @notice Emitted once the winning dart has been drawn, before any balance is
@@ -103,22 +163,48 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// against the real randomness actually drawn.
     event DrawDartDrawn(euint64 dart);
 
-    /// @notice Emitted when a draw completes, whether or not a prize was awarded.
+    /// @notice Emitted when a reveal is verified and a nonzero total moves the draw
+    /// into {DrawState.Walking}.
     /// @dev `clearTotal` and `prize` are plaintext by design: `clearTotal` was just
-    /// revealed by this same draw, and `prize` is intentionally public. Neither the
-    /// winner's identity nor any depositor's balance appears here.
+    /// revealed by this same draw, and `prize` is intentionally public.
+    event DrawRevealed(uint256 clearTotal, uint256 prize);
+
+    /// @notice Emitted when a draw completes: either an empty-pool reveal with no
+    /// walk, or a walk that has processed every depositor.
+    /// @dev `clearTotal` and `prize` are plaintext by design; see {DrawRevealed}.
+    /// Neither the winner's identity nor any depositor's balance appears here.
     event DrawCompleted(uint256 clearTotal, uint256 prize);
+
+    /// @notice Emitted when a stalled reveal is aborted.
+    event DrawAborted();
 
     /// @dev A confidential-transfer-and-call hook was invoked by a contract other than
     /// `asset`.
     error UnauthorizedToken(address caller);
 
     /// @dev {startDraw} was called before `drawInterval` had elapsed since {lastDraw},
-    /// or while a reveal was already outstanding.
+    /// or while a draw was already in progress.
     error DrawNotReady();
 
-    /// @dev {fulfillDraw} was called while no reveal was outstanding.
+    /// @dev {fulfillReveal} or {advanceDraw} was called while the draw was not at the
+    /// step that function handles.
     error NoDrawInProgress();
+
+    /// @dev {abortDraw} was called while the draw was not in {DrawState.Revealing},
+    /// or before `drawTimeout` had elapsed since {drawStartedAt}.
+    error AbortNotReady();
+
+    /// @dev A deposit or withdrawal was attempted while a draw was in progress.
+    error DrawActive();
+
+    /// @dev Reverts with {DrawActive} unless the draw is {DrawState.Idle}. Applied to
+    /// {onConfidentialTransferReceived} and {withdraw}: this is the freeze, spanning
+    /// the whole draw (Revealing through Walking), not just the walk, so that by the
+    /// time the walk runs, live balances still match the total that was revealed.
+    modifier whenIdle() {
+        if (drawState != DrawState.Idle) revert DrawActive();
+        _;
+    }
 
     /// @param asset_ The ctUSD confidential token this pool accepts deposits in and
     /// pays withdrawals and prizes out in.
@@ -126,10 +212,13 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// draw.
     /// @param drawInterval_ The minimum time between the start of one draw and the
     /// next.
-    constructor(IERC7984 asset_, IYieldSource yieldSource_, uint256 drawInterval_) {
+    /// @param drawTimeout_ The maximum time a draw may sit in {DrawState.Revealing}
+    /// before {abortDraw} may reset it.
+    constructor(IERC7984 asset_, IYieldSource yieldSource_, uint256 drawInterval_, uint256 drawTimeout_) {
         asset = asset_;
         yieldSource = yieldSource_;
         drawInterval = drawInterval_;
+        drawTimeout = drawTimeout_;
     }
 
     /// @notice Confidential-transfer-and-call hook invoked by `asset` to atomically
@@ -140,9 +229,10 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// `_totalDeposits`. Returns {FHESafeMath-tryIncrease}'s own `success` flag
     /// rather than a hardcoded `true`, so that if a credit were ever to fail, `asset`
     /// would refund the depositor instead of silently swallowing the deposit.
+    /// Reverts with {DrawActive} while any draw is in progress; see {whenIdle}.
     ///
-    /// In practice this failure branch is unreachable, not merely untested: the ctUSD
-    /// wrapper caps its confidential total supply at `type(uint64).max` (see
+    /// In practice the credit-failure branch is unreachable, not merely untested: the
+    /// ctUSD wrapper caps its confidential total supply at `type(uint64).max` (see
     /// {ERC7984ERC20Wrapper-maxTotalSupply}), so no single depositor's balance plus an
     /// incoming deposit can ever overflow a `euint64` add. This is defense in depth
     /// against that invariant changing upstream, not a path we can or should force
@@ -158,7 +248,7 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
         address from,
         euint64 amount,
         bytes calldata /* data */
-    ) external override returns (ebool accepted) {
+    ) external override whenIdle returns (ebool accepted) {
         if (msg.sender != address(asset)) revert UnauthorizedToken(msg.sender);
 
         _addDepositor(from);
@@ -191,10 +281,11 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// comparing encrypted values, since a revert that depends on whether the balance
     /// was sufficient would leak, via transaction success or failure, whether the
     /// caller could afford the requested amount. Storage is updated before the
-    /// external call to `asset` (checks-effects-interactions).
+    /// external call to `asset` (checks-effects-interactions). Reverts with
+    /// {DrawActive} while any draw is in progress; see {whenIdle}.
     /// @param requestedAmount The encrypted amount the caller wishes to withdraw.
     /// @param inputProof The zero-knowledge proof attesting to `requestedAmount`.
-    function withdraw(externalEuint64 requestedAmount, bytes calldata inputProof) external nonReentrant {
+    function withdraw(externalEuint64 requestedAmount, bytes calldata inputProof) external nonReentrant whenIdle {
         euint64 requested = FHE.fromExternal(requestedAmount, inputProof);
 
         euint64 balance = _balances[msg.sender];
@@ -220,10 +311,11 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     }
 
     /// @notice Starts a draw reveal: marks the encrypted aggregate total publicly
-    /// decryptable and snapshots its handle for {fulfillDraw} to verify against.
+    /// decryptable and snapshots its handle for {fulfillReveal} to verify against.
     /// @dev Permissionless: anyone may trigger a draw once `drawInterval` has
     /// elapsed since {lastDraw}. Reveals only the aggregate total; nothing about any
-    /// individual depositor's balance is touched.
+    /// individual depositor's balance is touched. From this call onward, deposits and
+    /// withdrawals revert with {DrawActive} until the draw returns to Idle.
     function startDraw() external {
         if (drawState != DrawState.Idle || block.timestamp < lastDraw + drawInterval) {
             revert DrawNotReady();
@@ -231,67 +323,95 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
 
         euint64 total = FHE.makePubliclyDecryptable(_totalDeposits);
         _revealingTotal = total;
+        drawStartedAt = block.timestamp;
         drawState = DrawState.Revealing;
 
         emit DrawStarted(total);
     }
 
-    /// @notice Completes a draw reveal with the publicly-decrypted aggregate total,
-    /// harvests the prize, and credits exactly one depositor: the winner.
+    /// @notice Verifies the publicly-decrypted aggregate total and, for a nonempty
+    /// pool, harvests the prize and draws the winning dart, moving the draw into
+    /// {DrawState.Walking} for {advanceDraw} to process.
     /// @dev Verifies `clearTotal` against the handle snapshotted by {startDraw} via
     /// {FHE.checkSignatures}, mirroring the same verification pattern used by
-    /// {ERC7984ERC20Wrapper-finalizeUnwrap}. Draw state is finalized (`drawState`
-    /// reset to `Idle`, `lastDraw` updated) immediately after that verification and
-    /// before the harvest or the winner walk, for both the zero-total and
-    /// nontrivial-total paths alike, so a reentrant call lands with `drawState`
-    /// already `Idle` and is rejected by {NoDrawInProgress} in addition to the
-    /// `nonReentrant` guard. If `clearTotal` is zero (an empty pool), the draw
-    /// completes with no harvest and no credit. Otherwise a prize is harvested from
-    /// `yieldSource` and a single winner is selected by drawing a uniformly random
-    /// dart in `[0, clearTotal)` and walking every depositor's encrypted balance as a
-    /// segment of `[0, clearTotal)`, crediting the prize to whichever depositor's
-    /// segment contains the dart and zero to everyone else. Every depositor's balance
-    /// handle changes, win or lose, so which handle changed cannot itself reveal the
-    /// winner.
+    /// {ERC7984ERC20Wrapper-finalizeUnwrap}. If `clearTotal` is zero (an empty pool),
+    /// the draw completes immediately with no harvest and no walk. Otherwise the
+    /// draw state is moved to Walking, and the depositor count and cursor are
+    /// snapshotted, before the external {IYieldSource-harvest} call, so a reentrant
+    /// call lands with `drawState` already `Walking` and is rejected by
+    /// {NoDrawInProgress} in addition to the `nonReentrant` guard; a harvested prize
+    /// is therefore always committed to a Walking draw that will run to completion,
+    /// never left stranded by a reveal that gets abandoned.
     ///
     /// The dart is drawn from a 128-bit random value reduced modulo `clearTotal` and
     /// then cast down to `euint64`, rather than reducing a 64-bit random directly:
     /// the modulo-reduction bias this leaves is bounded by `clearTotal / 2^128`,
     /// negligible for any total representable in a `euint64`.
-    ///
-    /// This walk is O(depositor count) and processes the entire depositor set in a
-    /// single transaction; chunking large depositor sets across multiple
-    /// transactions is deferred to a later phase.
     /// @param clearTotal The plaintext aggregate total, as publicly decrypted off
     /// chain from the handle {startDraw} snapshotted.
     /// @param proof The KMS decryption proof attesting to `clearTotal`.
-    function fulfillDraw(uint256 clearTotal, bytes calldata proof) external nonReentrant {
+    function fulfillReveal(uint256 clearTotal, bytes calldata proof) external nonReentrant {
         if (drawState != DrawState.Revealing) revert NoDrawInProgress();
 
         bytes32[] memory handles = new bytes32[](1);
         handles[0] = euint64.unwrap(_revealingTotal);
         FHE.checkSignatures(handles, abi.encode(clearTotal), proof);
 
-        drawState = DrawState.Idle;
-        lastDraw = block.timestamp;
-
         if (clearTotal == 0) {
+            drawState = DrawState.Idle;
+            lastDraw = block.timestamp;
             emit DrawCompleted(0, 0);
             return;
         }
 
+        drawState = DrawState.Walking;
+        _revealedTotal = clearTotal;
+        _cursor = 0;
+        _drawDepositorCount = _depositors.length;
+
         uint256 prize = yieldSource.harvest(address(this), clearTotal);
+        _prize = prize;
 
         euint128 rawDart = FHE.rem(FHE.randEuint128(), uint128(clearTotal));
         euint64 dart = FHE.asEuint64(rawDart);
+        FHE.allowThis(dart);
+        _dart = dart;
+
+        euint64 zero = FHE.asEuint64(0);
+        FHE.allowThis(zero);
+        _runningSum = zero;
+
         emit DrawDartDrawn(dart);
+        emit DrawRevealed(clearTotal, prize);
+    }
 
-        euint64 encryptedPrize = FHE.asEuint64(uint64(prize));
-        euint64 runningSum = FHE.asEuint64(0);
+    /// @notice Processes up to `maxSteps` (capped at {MAX_CHUNK}) more depositors of
+    /// the current walk, crediting the prize to whichever one's balance segment
+    /// contains the dart and zero to the rest.
+    /// @dev Uses the exact same segment-walk logic as a single-transaction draw would:
+    /// for each depositor in turn, `segmentStart` is the running sum before them,
+    /// the running sum is advanced by their balance, and they win if the dart falls
+    /// in `[segmentStart, runningSum)`. Every depositor snapshotted at
+    /// {fulfillReveal} is processed exactly once across however many calls this
+    /// takes; there is no early exit once a winner is found, so which depositor's
+    /// balance handle changed cannot itself reveal the winner. Once the cursor
+    /// reaches the snapshotted depositor count, the draw returns to {DrawState.Idle}
+    /// and {DrawCompleted} is emitted.
+    /// @param maxSteps The maximum number of depositors to process in this call.
+    function advanceDraw(uint256 maxSteps) external nonReentrant {
+        if (drawState != DrawState.Walking) revert NoDrawInProgress();
 
-        uint256 depositorTotal = _depositors.length;
-        for (uint256 i = 0; i < depositorTotal; i++) {
-            address depositor = _depositors[i];
+        uint256 cursor = _cursor;
+        uint256 remaining = _drawDepositorCount - cursor;
+        uint256 step = maxSteps < MAX_CHUNK ? maxSteps : MAX_CHUNK;
+        if (remaining < step) step = remaining;
+
+        euint64 dart = _dart;
+        euint64 runningSum = _runningSum;
+        euint64 encryptedPrize = FHE.asEuint64(uint64(_prize));
+
+        for (uint256 i = 0; i < step; i++) {
+            address depositor = _depositors[cursor + i];
             euint64 balance = _balances[depositor];
 
             euint64 segmentStart = runningSum;
@@ -309,7 +429,33 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
         }
         FHE.allowThis(_totalDeposits);
 
-        emit DrawCompleted(clearTotal, prize);
+        cursor += step;
+        _cursor = cursor;
+        FHE.allowThis(runningSum);
+        _runningSum = runningSum;
+
+        if (cursor == _drawDepositorCount) {
+            drawState = DrawState.Idle;
+            lastDraw = block.timestamp;
+            emit DrawCompleted(_revealedTotal, _prize);
+        }
+    }
+
+    /// @notice Resets a draw stalled in {DrawState.Revealing} back to {DrawState.Idle}.
+    /// @dev Permissionless. Only ever applies in Revealing, never in Walking; see the
+    /// contract-level note on why Walking needs no abort path. Does not update
+    /// {lastDraw}, so a fresh {startDraw} can be retried immediately rather than
+    /// waiting out another full `drawInterval`. Nothing needs to be unwound: no
+    /// prize has been harvested and no depositor has been touched, since both only
+    /// ever happen in {fulfillReveal}, after verification succeeds.
+    function abortDraw() external {
+        if (drawState != DrawState.Revealing || block.timestamp <= drawStartedAt + drawTimeout) {
+            revert AbortNotReady();
+        }
+
+        drawState = DrawState.Idle;
+
+        emit DrawAborted();
     }
 
     /// @notice Returns the encrypted balance of `depositor`.
@@ -344,6 +490,14 @@ contract Pool is IERC7984Receiver, ReentrancyGuard, ZamaEthereumConfig {
     /// @return depositor The depositor address at `index`.
     function depositorAt(uint256 index) external view returns (address depositor) {
         return _depositors[index];
+    }
+
+    /// @notice Returns how many depositors of the current walk have been processed
+    /// and how many were snapshotted in total.
+    /// @return cursor The number of depositors already processed in the current walk.
+    /// @return total The depositor count snapshotted when the current walk began.
+    function drawProgress() external view returns (uint256 cursor, uint256 total) {
+        return (_cursor, _drawDepositorCount);
     }
 
     /// @dev Adds `depositor` to the depositor set if not already present. Membership
