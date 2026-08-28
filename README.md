@@ -1,3 +1,5 @@
+# it’s a wip, i’m not gonna finish it. feel free to take the idea and run with it.
+
 # Sotto
 
 No-loss prize savings, private end to end. A confidential PoolTogether built on the Zama Protocol (FHEVM).
